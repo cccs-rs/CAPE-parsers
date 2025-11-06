@@ -24,6 +24,11 @@ jobs:
           python-version: "3.10"
           cache: 'pip'
 
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
       - name: Sync with upstream CAPE parsers
         run: |
           git remote add upstream https://github.com/CAPESandbox/CAPE-parsers
