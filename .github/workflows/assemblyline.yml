@@ -3,8 +3,6 @@ name: "Fetch CAPE parsers from upstream and make compatible with Assemblyline"
 on:
   schedule:
     - cron: "0 0 * * *" # daily at midnight
-  branches:
-    - main
 
 jobs:
   upstream_sync:
