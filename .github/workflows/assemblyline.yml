@@ -26,7 +26,8 @@ jobs:
 
       - name: Sync with upstream CAPE parsers
         run: |
-          gh repo sync
+          git remote add upstream https://github.com/CAPESandbox/CAPE-parsers
+          git fetch upstream
 
       - name: Inject CAPE's detection rules within the extractors
         run: |
