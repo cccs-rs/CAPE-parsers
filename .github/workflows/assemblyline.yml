@@ -1,0 +1,39 @@
+name: "Fetch CAPE parsers from upstream and make compatible with Assemblyline"
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # daily at midnight
+  branches:
+    - main
+
+jobs:
+  upstream_sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: 'pip'
+
+      - name: Sync with upstream CAPE parsers
+        run: |
+          gh repo sync
+
+      - name: Inject CAPE's detection rules within the extractors
+        run: |
+          python .github/scripts/rule_injection.py
+
+      - name: Commit changes to another branch
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "github-actions@github.com"
+          git checkout -b assemblyline
+          git add .
+          git commit -m "chore: Sync with upstream CAPE parsers and inject detection rules" -a
+          git push --set-upstream origin assemblyline --force
