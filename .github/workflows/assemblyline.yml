@@ -36,6 +36,7 @@ jobs:
           git remote add upstream https://github.com/CAPESandbox/CAPE-parsers
           git fetch upstream
           git merge upstream/main --allow-unrelated-histories -m "chore: Sync with upstream CAPE parsers"
+          git push origin main
 
       - name: Inject CAPE's detection rules within the extractors
         run: |
