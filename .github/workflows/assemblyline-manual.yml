@@ -1,13 +1,6 @@
-name: "(Scheduled) Fetch CAPE parsers from upstream and make compatible with Assemblyline"
+name: "(Manual) Fetch CAPE parsers from upstream and make compatible with Assemblyline"
 
-on:
-  schedule:
-    - cron: 0 */4 * * * # Every 4 hours
-
-# on:
-#   push:
-#     branches:
-#       - main
+on: workflow_dispatch
 
 jobs:
   upstream_sync:
