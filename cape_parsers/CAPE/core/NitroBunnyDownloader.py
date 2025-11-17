@@ -14,6 +14,7 @@
 
 import logging
 import struct
+from typing import List
 
 import pefile
 import yara
@@ -32,8 +33,8 @@ rule NitroBunnyDownloader
         cape_type = "NitroBunnyDownloader Payload"
         hash = "960e59200ec0a4b5fb3b44e6da763f5fec4092997975140797d4eec491de411b"
     strings:
-        $config1 = {E8 [3] 00 41 B8 ?? ?? 00 00 48 8D 15 [3] 00 48 89 C1 48 89 ?? E8 [3] 00}
-        $config2 = {E8 [3] 00 48 8D 15 [3] 00 41 B8 ?? ?? 00 00 48 89 C1 48 89 ?? E8 [3] 00}
+        $config1 = {E8 [3] 00 41 B8 ?? ?? 00 00 48 8D 15 [3] 00 48 89 C1 4? 89 ?? E8 [3] 00}
+        $config2 = {E8 [3] 00 48 8D 15 [3] 00 41 B8 ?? ?? 00 00 48 89 C1 4? 89 ?? E8 [3] 00}
         $string1 = "X-Amz-User-Agent:" wide
         $string2 = "Amz-Security-Flag:" wide
         $string3 = "/cart" wide
@@ -87,6 +88,20 @@ def read_string_list(data, off, count):
     return items, off
 
 
+def make_endpoints(cncs: List[str], port: int, uris: List[str]) -> List[str]:
+    endpoints = []
+    schema = {80: "http", 443: "https"}.get(port, "tcp")
+    for cnc in cncs:
+        base_url = f"{schema}://{cnc}"
+        if port not in (80, 443):
+            base_url += f":{port}"
+
+        for uri in uris:
+            endpoints.append(f"{base_url}/{uri.lstrip('/')}")
+
+    return endpoints
+
+
 def extract_config(filebuf):
     yara_hit = yara_scan(filebuf)
     if not yara_hit:
@@ -98,24 +113,20 @@ def extract_config(filebuf):
     config_offset = None
     rva_offset = None
 
+    CONFIG_OFFSETS = {
+        "$config1": (7, 14, 18),
+        "$config2": (14, 8, 12),
+    }
+
     for hit in yara_hit:
         if hit.rule != "NitroBunnyDownloader":
             continue
 
         for item in hit.strings:
-            for instance in item.instances:
-                if item.identifier == "$config1":
-                    config_code_offset = instance.offset
-                    config_size_offset = 7
-                    config_offset= 14
-                    rva_offset = 18
-                    break
-                elif item.identifier == "$config2":
-                    config_code_offset = instance.offset
-                    config_size_offset = 14
-                    config_offset= 8
-                    rva_offset = 12
-                    break
+            if item.identifier in CONFIG_OFFSETS and item.instances:
+                config_code_offset = item.instances[0].offset
+                config_size_offset, config_offset, rva_offset = CONFIG_OFFSETS[item.identifier]
+                break
 
             if config_code_offset:
                 break
@@ -126,33 +137,26 @@ def extract_config(filebuf):
     try:
         pe = pefile.PE(data=filebuf, fast_load=True)
         config_length = pe.get_dword_from_offset(config_code_offset + config_size_offset)
-        config = pe.get_dword_from_offset(config_code_offset + config_offset)
+        config_data_offset = pe.get_dword_from_offset(config_code_offset + config_offset)
         rva = pe.get_rva_from_offset(config_code_offset + rva_offset)
-        config_rva = rva + config
+        config_rva = rva + config_data_offset
         data = pe.get_data(config_rva, config_length)
         off = 0
-        raw = cfg["raw"] = {}
+        cfg["CNCs"] = []
         port, off = read_dword(data, off)
         num, off = read_dword(data, off)
         cncs, off = read_string_list(data, off, num)
         num, off = read_qword(data, off)
-        raw["user_agent"], off = read_utf16le_string(data, off, num)
+        cfg["user_agent"], off = read_utf16le_string(data, off, num)
         num, off = read_dword(data, off)
+        raw = cfg["raw"] = {}
         raw["http_header_items"], off = read_string_list(data, off, num)
         num, off = read_dword(data, off)
-        raw["uri_list"], off = read_string_list(data, off, num)
+        uris, off = read_string_list(data, off, num)
         raw["unknown_1"], off = read_dword(data, off)
         raw["unknown_2"], off = read_dword(data, off)
-
         if cncs:
-            cfg["CNCs"] = []
-            schema = {80: "http", 443: "https"}.get(port, "tcp")
-            for cnc in cncs:
-                cnc = f"{schema}://{cnc}"
-                if port not in (80, 443):
-                    cnc += f":{port}"
-
-                cfg["CNCs"].append(cnc)
+            cfg["CNCs"] = make_endpoints(cncs, port, uris)
 
     except Exception as e:
         log.error("Error: %s", e)

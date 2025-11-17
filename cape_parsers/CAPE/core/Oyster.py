@@ -12,21 +12,21 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-
+import ipaddress
 import logging
 import re
 import struct
 from contextlib import suppress
+from typing import List
 
-import yara
 import pefile
+import yara
 
 log = logging.getLogger(__name__)
 
 DESCRIPTION = "Oyster configuration parser."
 AUTHOR = "enzok"
-yara_rules = yara.compile(
-    source="""rule Oyster
+yara_rules = yara.compile(source="""rule Oyster
 {
     meta:
         author = "enzok"
@@ -45,8 +45,9 @@ yara_rules = yara.compile(
     condition:
         4 of them
 }
-"""
-)
+""")
+
+MIN_CHARS = 6
 
 
 def transform(src, lookup_table):
@@ -63,37 +64,137 @@ def transform(src, lookup_table):
             result = lookup_table[n]
             src[pVal] = result
             pVal -= 1
+
     return src
 
 
 def yara_scan(raw_data):
     try:
         return yara_rules.match(data=raw_data)
-    except Exception as e:
-        print(e)
+    except yara.Error as e:
+        log.error("Yara scan failed: %s", e)
+        return []
+
+
+def extract_utf16le(data, min_chars=MIN_CHARS):
+    results = []
+    n = len(data)
+    i = 0
+    while i < n - 1:
+        if 32 <= data[i] <= 126 and data[i + 1] == 0x00:
+            start = i
+            chars = []
+            while i < n - 1 and 32 <= data[i] <= 126 and data[i + 1] == 0x00:
+                chars.append(chr(data[i]))
+                i += 2
+
+            if len(chars) >= min_chars:
+                results.append((start, ''.join(chars)))
+        else:
+            i += 1
+
+    return results
+
+
+def is_uri(s: str) -> bool:
+    return s.lower().lstrip().startswith(("api/", "/api"))
+
+
+def is_c2(s: str) -> bool:
+    DOMAIN_RE = re.compile(r'^[a-zA-Z0-9.-]+\.(?:com|net)$', re.IGNORECASE)
+    IP_RE = re.compile(r'^(?:\d{1,3}\.){3}\d{1,3}$')
+
+    s = s.strip()
+    if DOMAIN_RE.match(s):
+        return True
+
+    if IP_RE.match(s):
+        try:
+            ip = ipaddress.IPv4Address(s)
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+                return False
+
+            return True
+        except ipaddress.AddressValueError:
+            return False
+
+    return False
+
+
+def is_useragent(s: str) -> bool:
+    return "mozilla" in s.lower()
+
+
+def is_mutex(s: str) -> bool:
+    if s.count('-') < 2:
+        return False
+
+    parts = [p.strip() for p in s.split('-') if p.strip()]
+    if len(parts) < 3:
+        return False
+
+    has_digit = any(any(ch.isdigit() for ch in part) for part in parts)
+    long_enough = all(len(part) > 1 for part in parts)
+    return has_digit and long_enough
+
+
+def extract_types(data: bytes):
+    uris = []
+    c2s = []
+    user_agent = None
+    mutexes = []
+
+    for off, s in extract_utf16le(data):
+        s_str = s.strip()
+        if is_uri(s_str) and s_str not in uris:
+            uris.append(s_str)
+
+        if is_c2(s_str) and s_str not in c2s:
+            c2s.append(s_str)
+
+        if user_agent is None and is_useragent(s_str):
+            user_agent = s_str
+
+        if is_mutex(s_str) and s_str not in mutexes:
+            mutexes.append(s_str)
+
+    return uris, c2s, user_agent, mutexes
+
+
+def make_endpoints(c2s: List[str], uris: List[str]) -> List[str]:
+    endpoints = []
+    for c2 in c2s:
+        for uri in uris:
+            endpoints.append(f"https://{c2}/{uri.lstrip('/')}")
+
+    return endpoints
 
 
 def extract_config(filebuf):
-    yara_hit = yara_scan(filebuf)
+    yara_hits = yara_scan(filebuf)
     config = {}
 
-    for hit in yara_hit:
+    for hit in yara_hits:
         if hit.rule == "Oyster":
             start_offset = ""
             lookup_va = ""
+
             for item in hit.strings:
                 if "$start_exit" == item.identifier:
                     start_offset = item.instances[0].offset
+
                 if "$decode" == item.identifier:
                     decode_offset = item.instances[0].offset
-                    lookup_va = filebuf[decode_offset + 12 : decode_offset + 16]
+                    lookup_va = filebuf[decode_offset + 12: decode_offset + 16]
+
             if not (start_offset and lookup_va):
-                return
+                continue
+
             try:
                 pe = pefile.PE(data=filebuf, fast_load=True)
                 lookup_offset = pe.get_offset_from_rva(struct.unpack("I", lookup_va)[0] - pe.OPTIONAL_HEADER.ImageBase)
-                lookup_table = filebuf[lookup_offset : lookup_offset + 256]
-                data = filebuf[start_offset + 4 : start_offset + 8092]
+                lookup_table = filebuf[lookup_offset: lookup_offset + 256]
+                data = filebuf[start_offset + 4: start_offset + 8092]
                 hex_strings = re.split(rb"\x00+", data)
                 hex_strings = [s for s in hex_strings if s]
                 str_vals = []
@@ -105,8 +206,10 @@ def extract_config(filebuf):
                 for item in hex_strings:
                     with suppress(Exception):
                         decoded = transform(bytearray(item), bytearray(lookup_table)).decode("utf-8")
+
                     if not decoded:
                         continue
+
                     if "http" in decoded:
                         if "\r\n" in decoded:
                             c2.extend(list(filter(None, decoded.split("\r\n"))))
@@ -121,15 +224,19 @@ def extract_config(filebuf):
                         if c2_matches:
                             c2.extend(c2_matches)
 
-                config = {
-                    "CNCs": c2,
-                    'version': dll_version,
-                    "raw": {
-                        "Strings": str_vals,
-                    },
-                }
+                config = {"CNCs": c2, 'version': dll_version, "raw": {"Strings": str_vals, }, }
+                return config
             except Exception as e:
                 log.error("Error: %s", e)
+
+    if not config:
+        urls = []
+        uris, c2s, useragent, mutexes = extract_types(filebuf)
+        if uris and c2s:
+            urls = make_endpoints(c2s, uris)
+
+        config = {"CNCs": urls, "user_agent": useragent, "mutex": mutexes, }
+
     return config
 
 

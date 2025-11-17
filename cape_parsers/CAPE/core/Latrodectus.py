@@ -154,6 +154,7 @@ def extract_config(filebuf):
                         minor = int.from_bytes(data[18:19], byteorder="big")
                         release = int.from_bytes(data[26:27], byteorder="big")
                         version = f"{major}.{minor}.{release}"
+
                     if "$key" in item.identifier:
                         key = instance.matched_data[4::5]
             try:
@@ -161,6 +162,7 @@ def extract_config(filebuf):
                 data_sections = [s for s in pe.sections if s.Name.find(b".data") != -1]
                 if not data_sections:
                     return
+
                 data = data_sections[0].get_data()
                 str_vals = []
                 c2 = []
