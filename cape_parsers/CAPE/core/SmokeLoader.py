@@ -14,17 +14,14 @@ rule SmokeLoader
 {
     meta:
         author = "kevoreilly"
-        description = "SmokeLoader Payload"
-        cape_type = "SmokeLoader Payload"
+        description = "SmokeLoader Config Extraction"
     strings:
-        $rc4_decrypt64 = {41 8D 41 01 44 0F B6 C8 42 0F B6 [2] 41 8D 04 12 44 0F B6 D0 42 8A [2] 42 88 [2] 42 88 [2] 42 0F B6 [2] 03 CA 0F B6 C1 8A [2] 30 0F 48 FF C7 49 FF CB 75}
-        $rc4_decrypt32 = {47 B9 FF 00 00 00 23 F9 8A 54 [2] 0F B6 C2 03 F0 23 F1 8A 44 [2] 88 44 [2] 88 54 [2] 0F B6 4C [2] 0F B6 C2 03 C8 81 E1 FF 00 00 00 8A 44 [2] 30 04 2B 43 3B 9C 24 [4] 72 C0}
-        $fetch_c2_64 = {74 ?? B? E8 03 00 00 B9 58 02 00 00 FF [5] 48 FF C? 75 F0 [6-10] 48 8D 05}
+        $fetch_c2_64_1 = {74 ?? B? E8 03 00 00 B9 58 02 00 00 FF [5] 48 (FF C?|83 EF 01) 75 (F0|EF) [6-10] 48 8D 05}
+        $fetch_c2_64_2 = {74 ?? B? E8 03 00 00 B9 58 02 00 00 FF [5] 48 (FF C?|83 EF 01) 75 (F0|EF) 33 C9 E8}
         $fetch_c2_32 = {8B 96 [2] (00|01) 00 8B CE 5E 8B 14 95 [4] E9}
     condition:
-        2  of them
+        any of them
 }
-
 """
 
 yara_rules = yara.compile(source=rule_source)
@@ -69,12 +66,23 @@ def extract_config(filebuf):
             continue
         for item in match.strings:
             for instance in item.instances:
-                if "$fetch_c2_64" in item.identifier:
+                if "$fetch_c2_64_1" in item.identifier:
                     match_offset = (int(instance.offset) & 0xFFFF) + instance.matched_length
                     try:
                         c2list_offset = (
                             struct.unpack("<I", filebuf[match_offset : match_offset + 4])[0] + match_offset + 4
                         ) & 0xFFFF
+                    except Exception:
+                        break
+                    delta = 8
+                if "$fetch_c2_64_2" in item.identifier:
+                    match_offset = (int(instance.offset) & 0xFFFF) + instance.matched_length
+                    try:
+                        func = (
+                            struct.unpack("<I", filebuf[match_offset : match_offset + 4])[0] + match_offset + 4
+                        ) & 0xFFFF
+                        c2list_pointer = struct.unpack("i", filebuf[func+11:func+15])[0]+func+15
+                        c2list_offset = struct.unpack("H", filebuf[c2list_pointer:c2list_pointer+2])[0]
                     except Exception:
                         break
                     delta = 8
