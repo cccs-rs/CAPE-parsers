@@ -15,14 +15,15 @@
 DESCRIPTION = "Zloader configuration parser"
 AUTHOR = "kevoreilly"
 
+import json
 import logging
+import re
 import socket
 import struct
 
 import pefile
-from Cryptodome.Cipher import ARC4
-
 import yara
+from Cryptodome.Cipher import ARC4
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +60,20 @@ rule Zloader2024
     condition:
         uint16(0) == 0x5A4D and $conf_1 and 2 of ($confkey_*)
 }
+
+rule Zloader2025
+{
+    meta:
+        author = "enzok"
+        description = "Zloader Payload"
+        cape_type = "Zloader Payload"
+    strings:
+        $conf = {4? 01 ?? [4] E8 [4] 4? 8D 15 [4] 4? 89 ?? 4? 89 ?? E8 [4] C7 46 30 00 00 00 00 8B 7E 34}
+        $confkey_1 = {4? 01 ?? [2] E8 [4] 4? 8D 15 [4] 4? 89 ?? 4? 89 ?? E8 [4] C7 46 34 00 00 00 00 8B 46 38}
+        $confkey_2 = {4? 01 ?? [2] E8 [4] 4? 8D 15 [4] 4? 89 ?? 4? 89 ?? E8 [4] C7 46 38 00 00 00 00 48 83 C4 28}
+    condition:
+        uint16(0) == 0x5A4D and $conf and all of ($confkey_*)
+}
 """
 MAX_STRING_SIZE = 32
 
@@ -71,41 +86,73 @@ def decrypt_rc4(key, data):
 
 
 def string_from_offset(data, offset):
-    return data[offset : offset + MAX_STRING_SIZE].split(b"\0", 1)[0]
+    return data[offset: offset + MAX_STRING_SIZE].split(b"\0", 1)[0]
 
 
-def parse_config(data):
+def parse_config(data, version=None):
+    for i in range(len(data) - 3, -1, -1):
+        if data[i : i + 3] == b"\x00\x00\x00":
+            data = data[:i]
+            break
+
     parsed = {}
-    parsed["botnet"] = data[4:].split(b"\x00", 1)[0].decode("utf-8")
-    parsed["campaign"] = data[25:].split(b"\x00", 1)[0].decode("utf-8")
-    c2s = []
-    c2_data = data[46:686]
-    for i in range(10):
-        chunk = c2_data[i * 64 : (i + 1) * 64]
-        chunk = chunk.rstrip(b"\x00")
-        if chunk:
-            c2s.append(chunk.decode("utf-8"))
-    parsed["CNCs"] = c2s
-    parsed["cryptokey"] = data[704:].split(b"\x00", 1)[0]
-    parsed["cryptokey_type"] = "RSA Public Key"
-    dns_data = data[1004:].split(b"\x00", 1)[0]
-    parsed["TLS SNI"] = dns_data.split(b"~")[0].decode("utf-8").rstrip()
-    parsed["DNS C2"] = dns_data.split(b"~")[1].decode("utf-8").strip()
+    net_params = []
     dns_ips = []
-    dns_ips.append(socket.inet_ntoa(data[1204:1208].split(b"\x00", 1)[0]))
-    dns_ip_data = data[1208:1248]
-    for i in range(10):
-        chunk = dns_ip_data[i * 4 : (i + 1) * 4]
-        chunk = chunk.rstrip(b"\x00")
-        if chunk:
-            dns_ips.append(socket.inet_ntoa(chunk))
-    parsed["DNS Servers"] = dns_ips
+    tls_sni = ""
+    cryptokey = ""
+    fields = [part.strip() for part in data.split(b'\x00') if part and part.strip()]
+    parsed["botnet"] = fields[0].decode("utf-8") if len(fields) > 0 else ""
+    parsed["campaign"] = fields[1].decode("utf-8") if len(fields) > 1 else ""
+    c2s = []
+    for f in fields:
+        if f.startswith(b"http"):
+            f = f.decode("utf-8")
+            if "~" in f:
+                tls_sni, f = map(str.strip, f.split("~", 1))
+
+            if f:
+                c2s.append(f)
+
+        elif b"PUBLIC KEY" in f:
+            cryptokey = f.decode("utf-8").replace("\n", "")
+
+        elif version == 3 and b"\x08\x08" in f and len(f) % 4 == 0:
+            idx = 0
+            for i in range(len(f) // 4):
+                dns_ips.append(socket.inet_ntoa(f[idx: idx + 4]))
+                idx += 4
+
+        elif version == 4 and f.startswith(b"[") and f.endswith(b"]"):
+            try:
+                params = json.loads(f)
+                for param in params:
+                    proto = param.get("proto", "unknown")
+                    ip = param.get("ip", "")
+                    port = param.get("port", 0)
+                    qps = param.get("qps", "")
+                    net_params.append(f"{proto}, {ip}:{port}, qps={qps}".strip())
+
+            except json.JSONDecodeError:
+                params = None
+
+    parsed["CNCs"] = c2s
+    parsed["cryptokey"] = cryptokey
+    parsed["cryptokey_type"] = "RSA Public Key"
+    raw = parsed["raw"] = {}
+    if tls_sni:
+        raw["tls sni"] = tls_sni
+
+    if net_params:
+        raw["dns config"] = net_params
+
+    if dns_ips:
+        raw["dns ips"] = dns_ips
+
     return parsed
 
 
 def extract_config(filebuf):
     config = {}
-    end_config = {}
     pe = pefile.PE(data=filebuf, fast_load=False)
     image_base = pe.OPTIONAL_HEADER.ImageBase
     matches = yara_rules.match(data=filebuf)
@@ -113,7 +160,7 @@ def extract_config(filebuf):
         return
     conf_type = ""
     decrypt_key = ""
-    conf_size = 1020
+    conf_size = None
     for match in matches:
         if match.rule == "Zloader":
             for item in match.strings:
@@ -137,17 +184,23 @@ def extract_config(filebuf):
                 elif "$decrypt_key_3" == item.identifier:
                     decrypt_key = item.instances[0].offset
                     kva_s = 3
+            break
+
         elif match.rule == "Zloader2024":
-            conf_size = 1264
+            conf_size = None
             rc4_chunk1 = None
             rc4_chunk2 = None
             numchunks = 0
             for item in match.strings:
-                if "$conf_1" == item.identifier:
+                item_id = item.identifier
+                if item_id == "$conf_1":
                     decrypt_conf = item.instances[0].offset + 6
                     conf_size = item.instances[0].offset + 12
+                    if conf_size > 2048:
+                        conf_size = 2048
+
                     conf_type = "3"
-                elif item.identifier.startswith("$confkey_") and numchunks < 2:
+                elif item_id.startswith("$confkey_") and numchunks < 2:
                     matched_data = item.instances[0].matched_data[:2]
                     if matched_data == b"\x48\x8D":
                         offset = 3
@@ -161,11 +214,32 @@ def extract_config(filebuf):
                         rc4_chunk2 = chunk_offset
 
                     numchunks += 1
+            break
+
+        elif match.rule == "Zloader2025":
+            conf_size = None
+            rc4_chunk1 = None
+            rc4_chunk2 = None
+            for item in match.strings:
+                item_id = item.identifier
+                if item_id == "$conf":
+                    decrypt_conf = item.instances[0].offset + 15
+                    size_base_offset = item.instances[0].offset + 5
+                    call_func_offset = item.instances[0].offset + 7
+                    call_func_size_offset = call_func_offset + 1
+                    conf_type = "4"
+
+                elif item_id == "$confkey_1":
+                    rc4_chunk1 = item.instances[0].offset + 13
+
+                elif item_id == "$confkey_2":
+                    rc4_chunk2 = item.instances[0].offset + 13
+            break
 
     if conf_type == "1":
-        va = struct.unpack("I", filebuf[decrypt_conf : decrypt_conf + 4])[0]
+        va = struct.unpack("I", filebuf[decrypt_conf: decrypt_conf + 4])[0]
         key = string_from_offset(filebuf, pe.get_offset_from_rva(va - image_base))
-        data_offset = pe.get_offset_from_rva(struct.unpack("I", filebuf[decrypt_conf + 5 : decrypt_conf + 9])[0] - image_base)
+        data_offset = pe.get_offset_from_rva(struct.unpack("I", filebuf[decrypt_conf + 5: decrypt_conf + 9])[0] - image_base)
         enc_data = filebuf[data_offset:].split(b"\0\0", 1)[0]
         raw = decrypt_rc4(key, enc_data)
         items = list(filter(None, raw.split(b"\x00\x00")))
@@ -178,15 +252,17 @@ def extract_config(filebuf):
             elif len(item) == 16:
                 config["cryptokey"] = item
                 config["cryptokey_type"] = "RC4"
+
     elif conf_type == "2" and decrypt_key:
-        conf_va = struct.unpack("I", filebuf[decrypt_conf + cva : decrypt_conf + cva + 4])[0]
+        conf_size = 1020
+        conf_va = struct.unpack("I", filebuf[decrypt_conf + cva: decrypt_conf + cva + 4])[0]
         conf_offset = pe.get_offset_from_rva(conf_va + pe.get_rva_from_offset(decrypt_conf) + cva + 4)
         # if not conf_size:
         # conf_size = struct.unpack("I", filebuf[decrypt_key + size_s : decrypt_key + size_s + 4])[0]
-        key_va = struct.unpack("I", filebuf[decrypt_key + kva_s : decrypt_key + kva_s + 4])[0]
+        key_va = struct.unpack("I", filebuf[decrypt_key + kva_s: decrypt_key + kva_s + 4])[0]
         key_offset = pe.get_offset_from_rva(key_va + pe.get_rva_from_offset(decrypt_key) + kva_s + 4)
         key = string_from_offset(filebuf, key_offset)
-        conf_data = filebuf[conf_offset : conf_offset + conf_size]
+        conf_data = filebuf[conf_offset: conf_offset + conf_size]
         raw = decrypt_rc4(key, conf_data)
         items = list(filter(None, raw.split(b"\x00\x00")))
         config["botnet"] = items[0].decode("utf-8")
@@ -198,24 +274,55 @@ def extract_config(filebuf):
             elif b"PUBLIC KEY" in item:
                 config["cryptokey"] = item.decode("utf-8").replace("\n", "")
                 config["cryptokey_type"] = "RSA Public key"
+
     elif conf_type == "3" and rc4_chunk1 and rc4_chunk2:
-        conf_va = struct.unpack("I", filebuf[decrypt_conf : decrypt_conf + 4])[0]
+        conf_va = struct.unpack("I", filebuf[decrypt_conf: decrypt_conf + 4])[0]
         conf_offset = pe.get_offset_from_rva(conf_va + pe.get_rva_from_offset(decrypt_conf) + 4)
-        conf_data = filebuf[conf_offset : conf_offset + conf_size]
-        keychunk1_va = struct.unpack("I", filebuf[rc4_chunk1 : rc4_chunk1 + 4])[0]
+        conf_data = filebuf[conf_offset: conf_offset + conf_size]
+        keychunk1_va = struct.unpack("I", filebuf[rc4_chunk1: rc4_chunk1 + 4])[0]
         keychunk1_offset = pe.get_offset_from_rva(keychunk1_va + pe.get_rva_from_offset(rc4_chunk1) + 4)
-        keychunk1 = filebuf[keychunk1_offset : keychunk1_offset + 16]
-        keychunk2_va = struct.unpack("I", filebuf[rc4_chunk2 : rc4_chunk2 + 4])[0]
+        keychunk1 = filebuf[keychunk1_offset: keychunk1_offset + 16]
+        keychunk2_va = struct.unpack("I", filebuf[rc4_chunk2: rc4_chunk2 + 4])[0]
         keychunk2_offset = pe.get_offset_from_rva(keychunk2_va + pe.get_rva_from_offset(rc4_chunk2) + 4)
-        keychunk2 = filebuf[keychunk2_offset : keychunk2_offset + 16]
+        keychunk2 = filebuf[keychunk2_offset: keychunk2_offset + 16]
         decrypt_key = bytes(a ^ b for a, b in zip(keychunk1, keychunk2))
         conf = decrypt_rc4(decrypt_key, conf_data)
-        end_config = parse_config(conf)
+        config = parse_config(conf, 3)
 
-    if config and end_config:
-        config = config.update({"raw": end_config})
+    elif conf_type == "4" and rc4_chunk1 and rc4_chunk2:
+        conf_va = struct.unpack("I", filebuf[decrypt_conf: decrypt_conf + 4])[0]
+        conf_offset = pe.get_offset_from_rva(conf_va + pe.get_rva_from_offset(decrypt_conf) + 4)
+        call_rva = pe.get_rva_from_offset(call_func_offset)
+        call_target_rva = call_rva + 5 + struct.unpack("i", filebuf[call_func_size_offset: call_func_size_offset + 4])[0]
+        call_target_offset = pe.get_offset_from_rva(call_target_rva)
+        function_tail = b"\x5F\x5E\xC3"
+        index = filebuf.find(function_tail, call_target_offset)
+        if index != -1:
+            index += 256
+
+        function_end_offset = index + len(function_tail)
+        function_data = filebuf[call_target_offset: function_end_offset]
+        pattern = re.compile(b"\x66\x81\xF1..\x66\x89\x4D.", re.DOTALL)
+        key = 0
+        for match in pattern.finditer(function_data):
+            off = match.start()
+            key = struct.unpack_from("<H", function_data, off + 3)[0]
+
+        size_base = struct.unpack_from("<H", filebuf[size_base_offset: size_base_offset + 2])[0]
+        conf_size = size_base ^ key & 0xFFFF
+        conf_data = filebuf[conf_offset: conf_offset + conf_size]
+        keychunk1_va = struct.unpack("I", filebuf[rc4_chunk1: rc4_chunk1 + 4])[0]
+        keychunk1_offset = pe.get_offset_from_rva(keychunk1_va + pe.get_rva_from_offset(rc4_chunk1) + 4)
+        keychunk1 = filebuf[keychunk1_offset: keychunk1_offset + 16]
+        keychunk2_va = struct.unpack("I", filebuf[rc4_chunk2: rc4_chunk2 + 4])[0]
+        keychunk2_offset = pe.get_offset_from_rva(keychunk2_va + pe.get_rva_from_offset(rc4_chunk2) + 4)
+        keychunk2 = filebuf[keychunk2_offset: keychunk2_offset + 16]
+        decrypt_key = bytes(a ^ b for a, b in zip(keychunk1, keychunk2))
+        conf = decrypt_rc4(decrypt_key, conf_data)
+        config = parse_config(conf, 4)
 
     return config
+
 
 if __name__ == "__main__":
     import sys
