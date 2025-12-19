@@ -40,14 +40,16 @@ def decrypt(data: bytes) -> Tuple[bytes, bytes, bytes]:
 def extract_config(data: bytes) -> Dict[str, Any]:
     cfg: Dict[str, Any] = {}
     plaintext = b""
+    data_section = None
 
     pe = pefile.PE(data=data, fast_load=True)
-    try:
-        data_section = [s for s in pe.sections if s.Name.find(b".data") != -1][0]
-    except IndexError:
-        return cfg
+    for s in pe.sections:
+        name = s.Name.decode("utf-8", errors="ignore").rstrip("\x00")
+        if name in ("UPX1", ".data"):
+            data_section = s
+            break
 
-    if not data_section:
+    if data_section is None:
         return cfg
 
     data = data_section.get_data()
