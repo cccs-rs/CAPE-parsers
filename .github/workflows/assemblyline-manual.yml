@@ -27,7 +27,7 @@ jobs:
           git config user.name "GitHub Actions"
           git config user.email "github-actions@github.com"
           git remote add upstream https://github.com/CAPESandbox/CAPE-parsers
-          git fetch upstream
+          git fetch -n upstream
           git merge -X theirs upstream/main --allow-unrelated-histories -m "chore: Sync with upstream CAPE parsers"
           git push origin main
 
