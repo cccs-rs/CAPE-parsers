@@ -169,3 +169,19 @@ if __name__ == "__main__":
 
     data = Path(sys.argv[1]).read_bytes()
     print(extract_config(data))
+
+detection_rule = """
+rule LokiBot
+{
+    meta:
+        author = "kevoreilly"
+        description = "LokiBot Payload"
+        cape_type = "LokiBot Payload"
+    strings:
+        $a1 = "DlRycq1tP2vSeaogj5bEUFzQiHT9dmKCn6uf7xsOY0hpwr43VINX8JGBAkLMZW"
+        $a2 = "last_compatible_version"
+    condition:
+        uint16(0) == 0x5A4D and (all of ($a*))
+}
+
+"""
