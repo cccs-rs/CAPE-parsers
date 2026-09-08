@@ -27,6 +27,7 @@ MIN_WORD_LEN = 3
 COVERAGE_THRESHOLD = 0.70
 STREAM_SEP = b"\x00\x00"
 STREAM_PROBE_LEN = 256
+WORD_RUN_MIN = 16
 WORD_NUL_RE = re.compile(rb"[A-Za-z0-9]{%d,}\x00" % MIN_WORD_LEN)
 
 # lea r8, [rip+start] / lea r9, [rip+end] / mov rsi, key
@@ -126,6 +127,38 @@ def carve_decoded_stream(raw: bytes, stream: bytes):
     return stream[: (len(stream) + 1) // stride]
 
 
+def decode_section_stream(alphabet, data: bytes):
+    """Return the payload from an encoded stream that lives outside the wordlist.
+
+    Later builds leave only the alphabet in the resource and give the encoded stream
+    a section of its own, where there is no wordlist around it to say where it
+    starts. Every entry is one alphabet word plus its separator, so a run of them is
+    found by that shape and then walked at its own stride -- on past the run, since
+    the separator of the last word is overwritten by whatever follows it.
+
+    The alphabet itself reads as such a run, and so does the tail a stream that has
+    already been decoded over leaves behind, so a candidate only counts once its
+    self-decrypting stub is there to vouch for it. The stub's bounds are relative to
+    where they sit, which is what lets that leftover tail still pass: it is the end
+    of the payload, short its overwritten head, and describes itself as much.
+    """
+    stride = len(next(iter(alphabet))) + 1
+    run_re = re.compile(rb"(?:[A-Za-z0-9]{%d}\x00){%d,}" % (stride - 1, WORD_RUN_MIN))
+
+    for match in run_re.finditer(data):
+        offset = match.start()
+        payload = bytearray()
+
+        while data[offset: offset + stride - 1] in alphabet:
+            payload.append(alphabet[data[offset: offset + stride - 1]])
+            offset += stride
+
+        if parse_xor_stub(bytes(payload)):
+            return bytes(payload)
+
+    return b""
+
+
 def parse_xor_stub(payload: bytes):
     """Return (key, start, end) for the payload's self-decrypting XOR stub.
 
@@ -214,10 +247,14 @@ def extract_payload(data: bytes):
     pe = pefile.PE(data=data, fast_load=True)
     pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_RESOURCE"]])
     payload = b""
+    alphabet = {}
 
     for raw in iter_resources(pe, data):
         if not looks_like_wordlist(raw):
             continue
+
+        words = [word for word in raw.split(b"\x00") if word]
+        alphabet = {word: value for value, word in enumerate(list(dict.fromkeys(words))[:256])}
 
         # An empty word separates the alphabet and its padding from the encoded stream.
         stream = raw.partition(STREAM_SEP)[2]
@@ -225,11 +262,14 @@ def extract_payload(data: bytes):
         if stream and not looks_like_wordlist(stream[:STREAM_PROBE_LEN]):
             decoded = carve_decoded_stream(raw, stream)
         else:
-            words = [word for word in raw.split(b"\x00") if word]
             decoded = decode_payload(words)
 
         if len(decoded) > len(payload):
             payload = decoded
+
+    # A resource left holding nothing but the alphabet has had its stream moved out.
+    if not payload and alphabet:
+        payload = decode_section_stream(alphabet, data)
 
     return decrypt_body(payload)
 
